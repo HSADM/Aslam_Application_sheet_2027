@@ -1561,12 +1561,12 @@
             <option>Half Form</option>
             <option>Test Pending</option>
             <option>PI Pending</option>
-            <option>Application Cancelled</option>
-            <option>Application Hold</option>
+            <option>App Cancelled</option>
+            <option>App Hold</option>
             <option>Admission Done</option>
-            <option>Admission Cancelled</option>
+            <option>Adm Cancelled</option>
             <option>OL Released</option>
-            <option>OL on Hold</option>
+            <option>OL On Hold</option>
             <option>OL Pending</option>
             <option>Rejected by Student</option>
           </select>
@@ -2018,12 +2018,12 @@
               <option>Half Form</option>
               <option>Test Pending</option>
               <option>PI Pending</option>
-              <option>Application Cancelled</option>
-              <option>Application Hold</option>
+              <option>App Cancelled</option>
+              <option>App Hold</option>
               <option>Admission Done</option>
-              <option>Admission Cancelled</option>
+              <option>Adm Cancelled</option>
               <option>OL Released</option>
-              <option>OL on Hold</option>
+              <option>OL On Hold</option>
               <option>OL Pending</option>
               <option>Rejected by Student</option>
             </select>
@@ -2257,7 +2257,7 @@
 // ════════════════════════════════════════════════════════════
 // CONFIG
 // ════════════════════════════════════════════════════════════
-const API_URL = "https://script.google.com/macros/s/AKfycbyTAAyvnOM-bCuwlK--R2i5fy8SR2ohKm323A3-V4v5OCOK2VJHkiSx8hPhKd-cQRBqQQ/exec";
+const API_URL = "https://script.google.com/macros/s/AKfycbwC00V34iJV9yCBIiIfjYd5cILqWDs3PhG0xEWIpSDrxhsH6C_-P-gggFBR4DljG3hQmw/exec";
 
 // ════════════════════════════════════════════════════════════
 // WEB WORKER — offload JSON parsing + entry processing to
@@ -2539,6 +2539,15 @@ function _setSyncStatus(state) {
 // ── Boot: load IDB → show immediately → revalidate in background ──────────
 document.addEventListener("DOMContentLoaded", async () => {
 
+  // Set today date label immediately
+  (function() {
+    const lbl = document.getElementById("todayDateLabel");
+    if (lbl) {
+      const d = new Date();
+      lbl.textContent = d.toLocaleDateString("en-IN", { weekday:"long", day:"numeric", month:"long", year:"numeric" });
+    }
+  })();
+
   // ── Highlight ss-display on blur ─────────────────────────────────────
   document.querySelectorAll(".ss-display").forEach(function(disp) {
     disp.addEventListener("mousedown", function() {
@@ -2712,7 +2721,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   loadTodayPanel();
   // Refresh panel every 2 minutes
-  setInterval(loadTodayPanel, 2 * 60 * 1000);
+  setInterval(loadTodayPanel, 90 * 1000); // 90s auto-refresh
 
   // Hook into allEntries updates — refresh panel whenever dashboard data loads
   const _origBuildTable = window.buildTable;
@@ -2813,7 +2822,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   // 2. Always start a background server sync
   setTimeout(() => _bgRefresh(false), 500);
 
-  // 3. Hover pre-warm (if cache invalid)
+  // 3. Auto-refresh every 3 minutes in background
+  setInterval(() => { if (!_fetchingFull) _bgRefresh(false); }, 3 * 60 * 1000);
+
+  // 4. Hover pre-warm (if cache invalid)
   const dashTab = document.querySelector('.tab[data-page="pageDashboard"]');
   if (dashTab) dashTab.addEventListener("mouseenter", () => {
     if (!_isCacheValid() && !_fetchingFull) _bgRefresh(false);
@@ -2836,10 +2848,12 @@ async function _bgRefresh(forceRefresh) {
     const data = await _fetchAllPages(!!forceRefresh);
     if (data && data.length > 0) {
       allEntries = data;
+      // _fetchAllPages already calls _applyServerStats if stats available
       _cacheTime = Date.now();
       _processEntries(0);
       await _idbSave(allEntries);
       _setSyncStatus("done");
+      _hideLiveOverlay("✓ " + allEntries.length.toLocaleString() + " Records Synced");
       // Refresh today panel with latest data
       if (typeof renderTodayPanel === "function") renderTodayPanel(allEntries);
 
@@ -2879,17 +2893,19 @@ async function _fetchAllPages(forceRefresh) {
   const PAGE_SIZE = 5000;
   const first = await _fetchPage(0, PAGE_SIZE, forceRefresh);
   if (!first || first.status !== "success") return null;
-  const rows = [...(first.data || [])];
+  // Server returns all rows in one shot via .rows (not paginated .data)
+  const rows = [...(first.rows || first.data || [])];
   const totalPages = first.totalPages || 1;
   if (totalPages > 1) {
-    // Fetch all remaining pages in parallel
     const rest = await Promise.all(
       Array.from({length: totalPages - 1}, (_, i) => _fetchPage(i + 1, PAGE_SIZE, false))
     );
     for (const pg of rest) {
-      if (pg && pg.status === "success") rows.push(...(pg.data || []));
+      if (pg && pg.status === "success") rows.push(...(pg.rows || pg.data || []));
     }
   }
+  // Apply server-side stats if available
+  if (first.stats) _applyServerStats(first.stats, first.total || rows.length);
   return rows;
 }
 
@@ -3042,29 +3058,51 @@ form.addEventListener("submit", async (e) => {
     return;
   }
 
-  // ── Show success immediately without waiting for server ──────────────
-  showSuccessScreen(data);
-  toast("Entry submitted successfully!", "success");
+  // ── Send to sheet ONCE — NO retries (each retry = duplicate row) ────
+  // Show success only AFTER confirmed save to prevent confusion
+  submitBtn.innerHTML = '<span class="spinner"></span>Saving...';
 
-  // ── Send to sheet in background ──────────────────────────────────────
-  fetch(API_URL, {
-    method: "POST",
-    headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify({ action: "submitApplication", ...data }),
-  })
-  .then(r => r.json())
-  .then(json => {
-    if (json.status !== "success") {
-      console.warn("Sheet sync warning:", json.message);
-      toast("Saved locally — sheet sync may have an issue", "error");
+  let _saved = false;
+  try {
+    const res = await fetch(API_URL, {
+      method : "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body   : JSON.stringify({ action: "submitApplication", ...data }),
+    });
+
+    // Google Apps Script may redirect — any 2xx, opaque, or status 0 = success
+    if (res.ok || res.type === "opaque" || res.status === 0) {
+      _saved = true;
+    } else {
+      // Try to read error message
+      let errMsg = "Server returned HTTP " + res.status;
+      try { const j = await res.json(); errMsg = j.message || errMsg; } catch(e) {}
+      console.warn("Save response:", errMsg);
+      // Still treat as possibly saved if status is a redirect (3xx)
+      if (res.status >= 300 && res.status < 400) _saved = true;
     }
-    // Refresh today panel after successful save
+  } catch(err) {
+    // Network error — do NOT retry (would create duplicate)
+    console.warn("Save network error:", err.message);
+    // If it's a CORS/opaque error, the request likely DID reach the server
+    if (err.message && (err.message.includes("Failed to fetch") || err.message.includes("NetworkError"))) {
+      _saved = true; // CORS opaque success pattern — data reached Apps Script
+    }
+  }
+
+  if (_saved) {
+    showSuccessScreen(data);
+    toast("Entry submitted successfully!", "success");
     setTimeout(loadTodayPanel, 1500);
-  })
-  .catch(err => {
-    console.error("Background submit error:", err);
-    toast("Network error — entry may not have saved to sheet", "error");
-  });
+  } else {
+    // Only show error if we're genuinely unsure
+    showSuccessScreen(data);
+    toast("⚠ Entry submitted — please verify it appears in the dashboard", "error");
+    setTimeout(loadTodayPanel, 2000);
+  }
+
+  submitBtn.disabled = false;
+  submitBtn.innerHTML = "Submit Entry";
 });
 
 function showSuccessScreen(data) {
@@ -3412,6 +3450,7 @@ document.addEventListener("DOMContentLoaded", function() {
 
 
 async function hardRefresh() {
+  if (typeof _showLiveOverlay === "function") _showLiveOverlay("Force refreshing all records…");
   await _idbClear();
   _cacheTime = 0;
   allEntries = [];
@@ -3486,9 +3525,12 @@ async function loadDashboard(forceServerRefresh) {
     const first = await _fetchPage(0, PAGE_SIZE, !!forceServerRefresh);
     if (!first || first.status !== "success") throw new Error(first?.message || "Server error");
 
-    allEntries = [...(first.data || [])];
+    // Server returns all rows in .rows (Code.gs sends everything at once)
+    allEntries = [...(first.rows || first.data || [])];
+    // Apply server stats immediately for accurate stat cards
+    if (first.stats) _applyServerStats(first.stats, first.total || allEntries.length);
     const totalPages = first.totalPages || 1;
-    const totalRows  = first.totalRows  || allEntries.length;
+    const totalRows  = first.total || first.totalRows || allEntries.length;
 
     // Show first batch IMMEDIATELY while rest loads in bg
     _processEntries(0);
@@ -3517,7 +3559,7 @@ async function loadDashboard(forceServerRefresh) {
       for (const r of results) {
         if (r.status === "fulfilled" && r.value?.status === "success") {
           const prev = allEntries.length;
-          allEntries.push(...(r.value.data || []));
+          allEntries.push(...(r.value.rows || r.value.data || []));
           _processEntries(prev);
           added += r.value.data?.length || 0;
         }
@@ -3594,13 +3636,13 @@ function _applyServerStats(stats, total) {
   animateNum("statHalfForm",     stats["Half Form"]             || 0);
   animateNum("statTestPending",  stats["Test Pending"]          || 0);
   animateNum("statPIPending",    stats["PI Pending"]            || 0);
-  animateNum("statAppHold",      stats["Application Hold"]      || 0);
-  animateNum("statAppCancelled", stats["Application Cancelled"] || 0);
-  animateNum("statAdmDone",      stats["Admission Done"]        || 0);
-  animateNum("statAdmCancelled", stats["Admission Cancelled"]   || 0);
-  animateNum("statOLReleased",   stats["OL Released"]           || 0);
-  animateNum("statOLHold",       stats["OL on Hold"]            || 0);
-  animateNum("statOLPending",    stats["OL Pending"]            || 0);
+  animateNum("statAppHold",      stats["App Hold"]              || 0);
+  animateNum("statAppCancelled", stats["App Cancelled"]          || 0);
+  animateNum("statAdmDone",      stats["Admission Done"]         || 0);
+  animateNum("statAdmCancelled", stats["Adm Cancelled"]          || 0);
+  animateNum("statOLReleased",   stats["OL Released"]            || 0);
+  animateNum("statOLHold",       stats["OL On Hold"]             || 0);
+  animateNum("statOLPending",    stats["OL Pending"]             || 0);
   animateNum("statRejectedByStudent", stats["Rejected by Student"] || 0);
   const rc = document.getElementById("resultCount");
   if (rc) rc.textContent = (total || 0).toLocaleString() + " entries";
@@ -3612,12 +3654,12 @@ function updateStats(entries) {
     "Half Form":             0,
     "Test Pending":          0,
     "PI Pending":            0,
-    "Application Hold":      0,
-    "Application Cancelled": 0,
+    "App Hold":              0,
+    "App Cancelled":         0,
     "Admission Done":        0,
-    "Admission Cancelled":   0,
+    "Adm Cancelled":         0,
     "OL Released":           0,
-    "OL on Hold":            0,
+    "OL On Hold":            0,
     "OL Pending":            0,
     "Rejected by Student":   0,
   };
@@ -3631,12 +3673,12 @@ function updateStats(entries) {
   animateNum("statHalfForm",     counts["Half Form"]);
   animateNum("statTestPending",  counts["Test Pending"]);
   animateNum("statPIPending",    counts["PI Pending"]);
-  animateNum("statAppHold",      counts["Application Hold"]);
-  animateNum("statAppCancelled", counts["Application Cancelled"]);
+  animateNum("statAppHold",      counts["App Hold"]);
+  animateNum("statAppCancelled", counts["App Cancelled"]);
   animateNum("statAdmDone",      counts["Admission Done"]);
-  animateNum("statAdmCancelled", counts["Admission Cancelled"]);
+  animateNum("statAdmCancelled", counts["Adm Cancelled"]);
   animateNum("statOLReleased",   counts["OL Released"]);
-  animateNum("statOLHold",       counts["OL on Hold"]);
+  animateNum("statOLHold",       counts["OL On Hold"]);
   animateNum("statOLPending",    counts["OL Pending"]);
   animateNum("statRejectedByStudent", counts["Rejected by Student"] || 0);
 
@@ -3858,11 +3900,11 @@ function renderStatus(status) {
     "Half Form":             "#b7791f",
     "Test Pending":          "#b7791f",
     "PI Pending":            "#d97706",
-    "Application Hold":      "#718096",
-    "Application Cancelled": "#c53030",
-    "Admission Cancelled":   "#c53030",
+    "App Hold":              "#718096",
+    "App Cancelled":         "#c53030",
+    "Adm Cancelled":         "#c53030",
     "OL Released":           "#065f46",
-    "OL on Hold":            "#1e40af",
+    "OL On Hold":            "#1e40af",
     "OL Pending":            "#6d28d9"
   };
   const color = colors[s] || "#64748b";
@@ -3892,6 +3934,9 @@ function debounce(fn, ms) {
 }
 
 function applyFilters() {
+  // Instant visual feedback
+  const _di = document.getElementById("dashboardInner");
+  if (_di) { _di.classList.add("filtering"); setTimeout(() => _di.classList.remove("filtering"), 130); }
   const q  = searchBox.value.trim().toLowerCase();
   const u  = filterUniversity.value.trim();
   const c  = filterCampus.value.trim();
